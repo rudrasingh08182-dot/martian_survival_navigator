@@ -15,5 +15,5 @@ COPY --chown=user . .
 # the elevation data (MOLA grid, Jezero and Gale DTMs, ~60 MB) goes into the image, so a restart is quick
 RUN python scripts/fetch_data.py
 
-EXPOSE 7860
-CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-7860} --app-dir backend --proxy-headers --forwarded-allow-ips "*"
+EXPOSE 10000
+CMD uvicorn app:app --host 0.0.0.0 --port ${PORT:-10000} --app-dir backend --proxy-headers --forwarded-allow-ips "*"
