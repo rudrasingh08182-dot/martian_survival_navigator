@@ -1,0 +1,692 @@
+"""Mars terrain + route analysis.
+
+Elevation comes from the sharpest source covering a point:
+  1. Local high-resolution DTMs (e.g. Jezero CTX, 20 m/px) - see LOCAL_DEMS
+  2. USGS HRSC/MOLA blended global DEM, 200 m/px, streamed as cached tiles - globaldem.py
+  3. MGS MOLA MEGDR global grid, 16 px/deg (~3.7 km/px) - offline fallback
+
+Coordinates: planetocentric latitude, EAST longitude in [-180, 180] (what the Leaflet map uses).
+Heights are metres relative to the MOLA areoid (the local DTMs are tied to MOLA).
+"""
+from __future__ import annotations
+
+import math
+import threading
+from collections import OrderedDict
+from pathlib import Path
+
+import numpy as np
+
+import globaldem
+
+MARS_RADIUS_M = 3_389_500
+DATA = Path(__file__).resolve().parent.parent / "data"
+MOLA_FILE = DATA / "mola_megdr_16ppd.img"
+PPD = 16
+LINES, SAMPLES = 180 * PPD, 360 * PPD
+
+_dem: np.ndarray | None = None
+
+
+def dem() -> np.ndarray:
+    global _dem
+    if _dem is None:
+        if not MOLA_FILE.exists():
+            raise FileNotFoundError("MOLA grid missing - run scripts/fetch_data.py")
+        _dem = np.memmap(MOLA_FILE, dtype=">i2", mode="r", shape=(LINES, SAMPLES))
+    return _dem
+
+
+# ---------- Global MOLA 463m GeoTIFF ------------------------------------
+
+MOLA463_FILE = DATA / "external" / "Mars_MGS_MOLA_DEM_mosaic_global_463m.tif"
+MOLA463_RADIUS = 3396190.0
+MOLA463_LABEL = "MGS MOLA (463 m)"
+
+_mola463_ds = None
+_mola463_lock = threading.RLock()
+
+
+def mola463_dataset():
+    """Open the large global DEM once. Rasterio reads only required windows."""
+    global _mola463_ds
+
+    if not MOLA463_FILE.exists():
+        return None
+
+    with _mola463_lock:
+        if _mola463_ds is None:
+            import rasterio
+            ds = rasterio.open(MOLA463_FILE)
+
+            if ds.count != 1:
+                ds.close()
+                raise ValueError("MOLA 463m DEM must contain one band")
+
+            _mola463_ds = ds
+
+        return _mola463_ds
+
+
+def mola463_elevation(lat: float, lon: float) -> float | None:
+    """Bilinear elevation from the global 463m MOLA GeoTIFF."""
+    from rasterio.windows import Window
+
+    if not -90 <= lat <= 90:
+        return None
+
+    ds = mola463_dataset()
+    if ds is None:
+        return None
+
+    lon = (lon + 180.0) % 360.0 - 180.0
+
+    x = MOLA463_RADIUS * math.radians(lon)
+    y = MOLA463_RADIUS * math.radians(lat)
+
+    col_edge, row_edge = (~ds.transform) * (x, y)
+
+    col = float(np.clip(col_edge - 0.5, 0, ds.width - 1))
+    row = float(np.clip(row_edge - 0.5, 0, ds.height - 1))
+
+    c0 = min(int(math.floor(col)), ds.width - 2)
+    r0 = min(int(math.floor(row)), ds.height - 2)
+
+    fx = col - c0
+    fy = row - r0
+
+    with _mola463_lock:
+        block = ds.read(
+            1,
+            window=Window(c0, r0, 2, 2),
+            masked=True,
+            out_dtype="float32"
+        )
+
+    values = block.filled(np.nan).astype(np.float64).ravel()
+
+    weights = np.array([
+        (1 - fy) * (1 - fx),
+        (1 - fy) * fx,
+        fy * (1 - fx),
+        fy * fx
+    ])
+
+    valid = np.isfinite(values)
+
+    if not valid.any():
+        return None
+
+    weights = weights[valid]
+    if weights.sum() <= 0:
+        return None
+
+    return float(np.sum(values[valid] * weights) / weights.sum())
+
+
+def mola463_grid(
+    lats: np.ndarray,
+    lons: np.ndarray
+) -> np.ndarray | None:
+    """Resample 463m MOLA into the globe's requested geographic grid."""
+    from affine import Affine
+    import rasterio
+    from rasterio.warp import reproject, Resampling
+
+    ds = mola463_dataset()
+    if ds is None:
+        return None
+
+    if len(lats) < 2 or len(lons) < 2:
+        out = np.full((len(lats), len(lons)), np.nan, dtype=np.float32)
+
+        for i, lat in enumerate(lats):
+            for j, lon in enumerate(lons):
+                value = mola463_elevation(float(lat), float(lon))
+                if value is not None:
+                    out[i, j] = value
+
+        return out
+
+    dx = MOLA463_RADIUS * math.radians(float(lons[1] - lons[0]))
+    dy = MOLA463_RADIUS * math.radians(float(lats[1] - lats[0]))
+
+    x0 = MOLA463_RADIUS * math.radians(float(lons[0]))
+    y0 = MOLA463_RADIUS * math.radians(float(lats[0]))
+
+    transform = Affine(
+        dx, 0, x0 - dx / 2,
+        0, dy, y0 - dy / 2
+    )
+
+    out = np.full(
+        (len(lats), len(lons)),
+        np.nan,
+        dtype=np.float32
+    )
+
+    with _mola463_lock:
+        reproject(
+            source=rasterio.band(ds, 1),
+            destination=out,
+            src_transform=ds.transform,
+            src_crs=ds.crs,
+            src_nodata=ds.nodata,
+            dst_transform=transform,
+            dst_crs=ds.crs,
+            dst_nodata=np.nan,
+            resampling=Resampling.bilinear,
+            num_threads=2
+        )
+
+    return out
+
+
+# ---------- Legacy 3.7km MOLA fallback ---------------------------------
+
+def _mola16_elevation(lat: float, lon: float) -> float:
+    """Original 3.7km MOLA elevation."""
+    d = dem()
+    lon360 = lon % 360
+    y = (90 - lat) * PPD - 0.5
+    x = lon360 * PPD - 0.5
+
+    y0 = int(np.clip(math.floor(y), 0, LINES - 2))
+    x0 = int(math.floor(x)) % SAMPLES
+    x1 = (x0 + 1) % SAMPLES
+
+    fy, fx = np.clip(y - y0, 0, 1), x - math.floor(x)
+
+    top = d[y0, x0] * (1 - fx) + d[y0, x1] * fx
+    bot = d[y0 + 1, x0] * (1 - fx) + d[y0 + 1, x1] * fx
+
+    return float(top * (1 - fy) + bot * fy)
+
+
+def _mola16_grid(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Original 3.7km MOLA grid."""
+    d = dem()
+
+    y = np.clip((90 - lats) * PPD - 0.5, 0, LINES - 1.001)
+    x = (lons % 360) * PPD - 0.5
+
+    y0 = y.astype(int)
+    x0f = np.floor(x)
+
+    x0 = x0f.astype(int) % SAMPLES
+    x1 = (x0f.astype(int) + 1) % SAMPLES
+
+    fy = (y - y0)[:, None]
+    fx = (x - x0f)[None, :]
+
+    rows0 = np.asarray(d[y0], dtype=np.float32)
+    rows1 = np.asarray(d[y0 + 1], dtype=np.float32)
+
+    top = rows0[:, x0] * (1 - fx) + rows0[:, x1] * fx
+    bot = rows1[:, x0] * (1 - fx) + rows1[:, x1] * fx
+
+    return top * (1 - fy) + bot * fy
+
+
+def mola_elevation(lat: float, lon: float) -> float:
+    """Prefer 463m MOLA, otherwise use original 3.7km MOLA."""
+    value = mola463_elevation(lat, lon)
+
+    if value is not None:
+        return value
+
+    return _mola16_elevation(lat, lon)
+
+
+def mola_grid_with_source(
+    lats: np.ndarray,
+    lons: np.ndarray
+) -> tuple[np.ndarray, str]:
+    """463m MOLA grid, with legacy MOLA filling any missing pixels."""
+    high = mola463_grid(lats, lons)
+
+    if high is None:
+        return _mola16_grid(lats, lons), MOLA_LABEL
+
+    missing = ~np.isfinite(high)
+
+    if missing.any():
+        fallback = _mola16_grid(lats, lons)
+        high[missing] = fallback[missing]
+
+    if missing.all():
+        return high, MOLA_LABEL
+
+    source = (
+        f"{MOLA463_LABEL} + legacy fallback"
+        if missing.any()
+        else MOLA463_LABEL
+    )
+
+    return high, source
+
+
+def mola_grid(lats: np.ndarray, lons: np.ndarray) -> np.ndarray:
+    """Return the best available global MOLA grid."""
+    return mola_grid_with_source(lats, lons)[0]
+
+
+class LocalDEM:
+    """GeoTIFF DTM, either equirectangular in metres (e.g. USGS Mars 2020 TRN products) or plain
+    lat/lon degrees (e.g. an export from a Mars Trek image service)."""
+
+    def __init__(self, name: str, path: Path, label: str):
+        self.name, self.path, self.label = name, path, label
+        self._a = None
+
+    def _load(self):
+        import logging
+        import tifffile  # only needed when a local DEM is present
+        logging.getLogger("tifffile").setLevel(logging.ERROR)  # benign GDAL_NODATA parse notice
+        with tifffile.TiffFile(self.path) as t:
+            page = t.pages[0]
+            a = page.asarray().astype(np.float32)
+            sx, sy, _ = page.tags["ModelPixelScaleTag"].value
+            _, _, _, x0, y0, _ = page.tags["ModelTiepointTag"].value
+            geo = t.geotiff_metadata
+            radius = geo["GeogSemiMajorAxisGeoKey"]
+        if int(geo.get("GTModelTypeGeoKey", 1)) == 2:  # geographic: pixel sizes are degrees
+            res_m = sx * math.pi / 180 * radius
+            radius = 180 / math.pi                       # so that radians(lon) * radius = lon
+        else:
+            res_m = sx
+        a[a < -1e20] = np.nan
+        self._a, self.res_m = a, round(res_m, 1)
+        self.x0, self.y0, self.sx, self.sy, self.radius = x0, y0, sx, sy, radius
+        k = 180 / (math.pi * radius)
+        h, w = a.shape
+        self.bounds = (y0 - h * sy) * k, x0 * k, y0 * k, (x0 + w * sx) * k  # S, W, N, E
+
+    def available(self) -> bool:
+        if self._a is None and self.path.exists():
+            self._load()
+        return self._a is not None
+
+    def sample(self, lat: float, lon: float) -> float | None:
+        if not self.available():
+            return None
+        s, w, n, e = self.bounds
+        if not (s <= lat <= n and w <= lon <= e):
+            return None
+        x = (math.radians(lon) * self.radius - self.x0) / self.sx - 0.5
+        y = (self.y0 - math.radians(lat) * self.radius) / self.sy - 0.5
+        h, wd = self._a.shape
+        xi, yi = int(math.floor(x)), int(math.floor(y))
+        if not (0 <= xi < wd - 1 and 0 <= yi < h - 1):
+            return None
+        fx, fy = x - xi, y - yi
+        q = self._a[yi:yi + 2, xi:xi + 2]
+        if np.isnan(q).any():
+            return None
+        v = (q[0, 0] * (1 - fx) + q[0, 1] * fx) * (1 - fy) + (q[1, 0] * (1 - fx) + q[1, 1] * fx) * fy
+        return float(v)
+
+    def overlaps(self, s: float, w: float, n: float, e: float) -> bool:
+        if not self.available():
+            return False
+        bs, bw, bn, be = self.bounds
+        return s < bn and n > bs and w < be and e > bw
+
+    def fill(self, lats: np.ndarray, lons: np.ndarray, out: np.ndarray) -> None:
+        """Overwrite out (lats x lons grid) with this DTM's heights wherever it has data."""
+        h, wd = self._a.shape
+        y = (self.y0 - np.radians(lats) * self.radius) / self.sy - 0.5
+        x = (np.radians(lons) * self.radius - self.x0) / self.sx - 0.5
+        Y, X = np.meshgrid(y, x, indexing="ij")
+        ok = (X >= 0) & (X < wd - 1) & (Y >= 0) & (Y < h - 1)
+        if not ok.any():
+            return
+        xi, yi = X[ok].astype(int), Y[ok].astype(int)
+        fx, fy = X[ok] - xi, Y[ok] - yi
+        a = self._a
+        v = ((a[yi, xi] * (1 - fx) + a[yi, xi + 1] * fx) * (1 - fy) +
+             (a[yi + 1, xi] * (1 - fx) + a[yi + 1, xi + 1] * fx) * fy)
+        good = ~np.isnan(v)
+        idx = np.flatnonzero(ok)[good]
+        out.flat[idx] = v[good]
+
+
+LOCAL_DEMS = [
+    LocalDEM("jezero_ctx", DATA / "jezero_ctx_dtm_20m.tif", "CTX Jezero DTM (20 m)"),
+    LocalDEM("gale_hirise", DATA / "gale_hirise_dtm_20m.tif", "HiRISE Gale DTM (20 m)"),
+]
+MOLA_LABEL = "MGS MOLA (3.7 km)"
+
+
+def elevation_src(lat: float, lon: float, fetch: bool = True) -> tuple[float, str]:
+    """(elevation m, source label) from the sharpest DEM covering the point."""
+    for d in LOCAL_DEMS:
+        v = d.sample(lat, lon)
+        if v is not None:
+            return v, d.label
+    v = globaldem.sample(lat, lon, fetch)
+    if v is not None:
+        return v, globaldem.LABEL
+    value = mola463_elevation(lat, lon)
+
+    if value is not None:
+        return value, MOLA463_LABEL
+
+    return _mola16_elevation(lat, lon), MOLA_LABEL
+
+
+def prefetch(s: float, w: float, n: float, e: float) -> None:
+    """Warm the 200 m global DEM for an area (skipped where a local DTM covers it all)."""
+    if any(d.available() and d.bounds[0] <= s and d.bounds[1] <= w and d.bounds[2] >= n and d.bounds[3] >= e for d in LOCAL_DEMS):
+        return
+    globaldem.prefetch(s, w, n, e)
+
+
+def elevation(lat: float, lon: float) -> float:
+    return elevation_src(lat, lon)[0]
+
+
+# --- 3D globe terrain tiles -------------------------------------------------------------------
+# Heightmaps for the 3D globe on a geographic tile grid (level 0 = two 180° tiles, like the map
+# imagery): TILE_N x TILE_N int16 metres, row 0 = north, samples on the tile edges. The planet
+# view uses the local MOLA grid (instant); closer in, the 200 m blend; in Jezero, the 20 m DTM.
+TILE_N = 65
+NET_LEVEL = 8        # from this level on, the 200 m tiles add real detail over MOLA's 3.7 km
+LOCAL_LEVEL = 9      # and from here, local DTMs
+_tiles: OrderedDict[tuple[int, int, int], tuple[bytes, str]] = OrderedDict()
+_tiles_lock = threading.Lock()
+MAX_TILE_CACHE = 6000  # ~50 MB
+
+
+def tile_heights(z: int, x: int, y: int) -> tuple[np.ndarray, str]:
+    span = 180 / 2 ** z
+    lat_n, lon_w = 90 - y * span, -180 + x * span
+    t = np.arange(TILE_N) * (span / (TILE_N - 1))
+    lats, lons = lat_n - t, lon_w + t
+    h, src = None, MOLA_LABEL
+    if z >= NET_LEVEL:
+        h = globaldem.tile_grid(z, x, y, TILE_N)
+        if h is not None:
+            src = globaldem.LABEL
+    if h is None:
+        h, src = mola_grid_with_source(lats, lons)
+    if z >= LOCAL_LEVEL:
+        for d in LOCAL_DEMS:
+            if d.overlaps(lats[-1], lons[0], lats[0], lons[-1]):
+                h = np.array(h, dtype=np.float32)
+                d.fill(lats, lons, h)
+                src = d.label
+    return np.round(h).astype("<i2"), src
+
+
+MODEL_NET_KM = 200   # areas up to this wide get the 200 m blend (<= 16 tiles); bigger ones MOLA, plenty at that scale
+
+
+def area_grid(s: float, w: float, n: float, e: float, nx: int, ny: int) -> tuple[np.ndarray, str]:
+    """nx x ny heights (m) over an area, row 0 = north, from the sharpest data covering it — for
+    3D-printed relief models."""
+    lats, lons = np.linspace(n, s, ny), np.linspace(w, e, nx)
+    wide_km = max(n - s, (e - w) * math.cos(math.radians((n + s) / 2))) * MARS_RADIUS_M * math.pi / 180 / 1000
+    h, src = None, MOLA_LABEL
+    if wide_km <= MODEL_NET_KM:
+        h = globaldem.grid(lats, lons)
+        if h is not None:
+            src = globaldem.LABEL
+    if h is None:
+        h, src = mola_grid_with_source(lats, lons)
+        h = h.astype(np.float32)
+    for d in LOCAL_DEMS:
+        if d.overlaps(s, w, n, e):
+            before = h.copy()
+            d.fill(lats, lons, h)
+            if not np.array_equal(before, h):
+                src = d.label if d.bounds[0] <= s and d.bounds[1] <= w and d.bounds[2] >= n and d.bounds[3] >= e else f"{d.label} + {src}"
+    return h.astype(np.float32), src
+
+
+def tile_bytes(z: int, x: int, y: int) -> tuple[bytes, str]:
+    key = (z, x, y)
+    with _tiles_lock:
+        if key in _tiles:
+            _tiles.move_to_end(key)
+            return _tiles[key]
+    h, src = tile_heights(z, x, y)
+    out = (h.tobytes(), src)
+    if z < NET_LEVEL or src != MOLA_LABEL:  # don't keep a MOLA stand-in for a tile the network missed
+        with _tiles_lock:
+            _tiles[key] = out
+            while len(_tiles) > MAX_TILE_CACHE:
+                _tiles.popitem(last=False)
+    return out
+
+
+def dem_coverage() -> list[dict]:
+    out = [{"name": "mola", "label": MOLA_LABEL, "resolution_m": 3697, "bounds": [-90, -180, 90, 180]},
+           {"name": "hrsc_mola", "label": globaldem.LABEL, "resolution_m": globaldem.RES_M, "bounds": [-90, -180, 90, 180]}]
+    ds = mola463_dataset()
+
+    if ds is not None:
+        k = 180 / (math.pi * MOLA463_RADIUS)
+
+        out.insert(1, {
+            "name": "mola_463m",
+            "label": MOLA463_LABEL,
+            "resolution_m": round(ds.res[0], 2),
+            "bounds": [
+                ds.bounds.bottom * k,
+                ds.bounds.left * k,
+                ds.bounds.top * k,
+                ds.bounds.right * k
+            ]
+        })
+    for d in LOCAL_DEMS:
+        if d.available():
+            out.append({"name": d.name, "label": d.label, "resolution_m": d.res_m, "bounds": list(d.bounds)})
+    return out
+
+
+def haversine_m(a: tuple[float, float], b: tuple[float, float]) -> float:
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    h = math.sin((la2 - la1) / 2) ** 2 + math.cos(la1) * math.cos(la2) * math.sin((lo2 - lo1) / 2) ** 2
+    return 2 * MARS_RADIUS_M * math.asin(math.sqrt(h))
+
+
+def _interp(a, b, t):
+    """Point a fraction t along the great circle a->b."""
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    p1 = np.array([math.cos(la1) * math.cos(lo1), math.cos(la1) * math.sin(lo1), math.sin(la1)])
+    p2 = np.array([math.cos(la2) * math.cos(lo2), math.cos(la2) * math.sin(lo2), math.sin(la2)])
+    om = math.acos(float(np.clip(p1 @ p2, -1, 1)))
+    if om < 1e-12:
+        return a
+    p = (math.sin((1 - t) * om) * p1 + math.sin(t * om) * p2) / math.sin(om)
+    return math.degrees(math.asin(p[2])), math.degrees(math.atan2(p[1], p[0]))
+
+
+# --- EVA model --------------------------------------------------------------------------
+# Tobler's hiking function, slowed for a pressurised suit. Apollo EVA traverses averaged
+# roughly 1-2 km/h on foot; we scale Tobler's ~5 km/h flat speed by SUIT_FACTOR to match.
+SUIT_FACTOR = 0.35
+O2_HOURS = 8.0          # typical PLSS consumable budget
+RESERVE_FRACTION = 0.2  # keep 20 % in reserve for walk-back / contingencies
+HAZARD_SLOPE_DEG = 15   # steeper than this is flagged as hazardous on foot
+
+
+def walking_speed_kmh(slope: float) -> float:
+    """slope = rise/run (signed)."""
+    return 6 * math.exp(-3.5 * abs(slope + 0.05)) * SUIT_FACTOR
+
+
+COMPASS = ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE",
+           "S", "SSW", "SW", "WSW", "W", "WNW", "NW", "NNW"]
+COMPASS_WORDS = {"N": "north", "NE": "northeast", "E": "east", "SE": "southeast",
+                 "S": "south", "SW": "southwest", "W": "west", "NW": "northwest"}
+
+
+def bearing_deg(a, b) -> float:
+    """Initial great-circle bearing a->b, degrees clockwise from north."""
+    la1, lo1, la2, lo2 = map(math.radians, (a[0], a[1], b[0], b[1]))
+    y = math.sin(lo2 - lo1) * math.cos(la2)
+    x = math.cos(la1) * math.sin(la2) - math.sin(la1) * math.cos(la2) * math.cos(lo2 - lo1)
+    return (math.degrees(math.atan2(y, x)) + 360) % 360
+
+
+def compass(b: float) -> str:
+    return COMPASS[int((b + 11.25) // 22.5) % 16]
+
+
+def turn_instruction(prev_bearing: float | None, bearing: float) -> str:
+    if prev_bearing is None:
+        return "Head"
+    d = (bearing - prev_bearing + 540) % 360 - 180  # -180..180, + = right
+    a = abs(d)
+    if a < 15:
+        return "Continue straight"
+    side = "right" if d > 0 else "left"
+    if a < 45:
+        return f"Bear {side}"
+    if a < 120:
+        return f"Turn {side}"
+    if a < 165:
+        return f"Sharp {side}"
+    return "Turn around"
+
+
+def slope_class(deg: float) -> str:
+    if deg < 3:
+        return "flat"
+    if deg < 8:
+        return "gentle"
+    if deg < HAZARD_SLOPE_DEG:
+        return "moderate"
+    if deg < 25:
+        return "steep"
+    return "dangerous"
+
+
+def describe_terrain(ascent: float, descent: float, dist_m: float, max_slope: float) -> str:
+    net = ascent - descent
+    grade = abs(net) / dist_m * 100 if dist_m else 0
+    rolling = min(ascent, descent) > 0.3 * max(ascent, descent, 1) and max(ascent, descent) > 20
+    if rolling:
+        base = "Rolling terrain with ups and downs"
+    elif grade < 0.5 and max(ascent, descent) < 15:
+        base = "Mostly level ground"
+    elif net > 0:
+        base = "Hard climb" if grade >= 8 or max_slope >= 8 else "Steady climb"
+    else:
+        base = "Steep descent" if grade >= 8 or max_slope >= 8 else "Gradual descent"
+    return f"{base} ({slope_class(max_slope)} slopes, max {max_slope:.0f}°)"
+
+
+def profile(waypoints: list[tuple[float, float]], step_m: float = 250, detours: list[dict | None] | None = None) -> dict:
+    """Densified elevation profile + per-leg directions + traverse totals for (lat, lon) waypoints.
+    detours[i], if given, is a gentler line for leg i (pathfind.safe_leg) to follow instead of
+    the straight one."""
+    samples: list[dict] = []
+    legs: list[dict] = []
+    hazards: list[dict] = []
+    dist = hours = 0.0
+    prev_bearing = None
+
+    sources: dict[str, int] = {}
+
+    def add_sample(p, z, slope_deg, leg, src, t_h=0.0):
+        sources[src] = sources.get(src, 0) + 1
+        samples.append({"dist_m": round(dist, 1), "lat": round(p[0], 6), "lon": round(p[1], 6),
+                        "elev_m": round(z, 1), "slope_deg": round(slope_deg, 2), "leg": leg, "src": src,
+                        "t_h": round(t_h, 4)})  # cumulative walking hours to reach this point
+
+    # the line each leg follows: straight, or the detour's vertices
+    lines = [(detours[i]["path"] if detours and detours[i] else [tuple(a), tuple(b)])
+             for i, (a, b) in enumerate(zip(waypoints, waypoints[1:]))]
+    # keep the sample count sane on very long routes
+    total = sum(haversine_m(p, q) for line in lines for p, q in zip(line, line[1:]))
+    # walking-scale routes get the 200 m global DEM; for very long (rover-scale) routes the
+    # tile downloads aren't worth it - MOLA (local file) is plenty at that scale
+    use_net = total <= 120_000
+    if use_net:
+        la = [p[0] for p in waypoints]; lo = [p[1] for p in waypoints]
+        prefetch(min(la) - 0.01, min(lo) - 0.01, max(la) + 0.01, max(lo) + 0.01)
+    step_m = max(step_m, total / 3000)
+
+    first = tuple(waypoints[0])
+    z0, src0 = elevation_src(*first, fetch=use_net)
+    add_sample(first, z0, 0.0, 0, src0)
+
+    for li, (a, b) in enumerate(zip(waypoints, waypoints[1:])):
+        pts = []
+        for p, q in zip(lines[li], lines[li][1:]):
+            n = max(1, int(haversine_m(p, q) // step_m))
+            pts += [_interp(p, q, i / n) for i in range(1, n)] + [tuple(q)]
+        pts[-1] = tuple(b)
+        leg_start_idx = len(samples) - 1
+        leg_dist = leg_hours = asc = desc = leg_max = 0.0
+        leg_hazards = 0
+        prev_pt, prev_z = tuple(a), samples[-1]["elev_m"]
+        for p in pts:
+            z, src = elevation_src(*p, fetch=use_net)
+            d = haversine_m(prev_pt, p)
+            dz = z - prev_z
+            slope_deg = math.degrees(math.atan(abs(dz) / d)) if d > 0 else 0.0
+            if d > 0:
+                leg_hours += (d / 1000) / walking_speed_kmh(dz / d)
+            dist += d
+            leg_dist += d
+            asc += max(dz, 0)
+            desc += max(-dz, 0)
+            leg_max = max(leg_max, slope_deg)
+            if slope_deg > HAZARD_SLOPE_DEG:
+                leg_hazards += 1
+                hazards.append({"dist_m": round(dist), "lat": p[0], "lon": p[1],
+                                "slope_deg": round(slope_deg, 1), "leg": li})
+            add_sample(p, z, slope_deg, li, src, hours + leg_hours)
+            prev_pt, prev_z = p, z
+        hours += leg_hours
+
+        brg = bearing_deg(a, b)
+        det = detours[li] if detours else None
+        terrain_text = describe_terrain(asc, desc, leg_dist, leg_max)
+        if det:
+            terrain_text += f" · bends around {det['straight_steep_m']} m of >{HAZARD_SLOPE_DEG}° ground on the direct line"
+        legs.append({
+            "index": li,
+            "from_idx": leg_start_idx, "to_idx": len(samples) - 1,
+            "instruction": turn_instruction(prev_bearing, brg),
+            "bearing_deg": round(brg), "compass": compass(brg),
+            "distance_km": round(leg_dist / 1000, 3),
+            "ascent_m": round(asc), "descent_m": round(desc),
+            "start_elev_m": round(samples[leg_start_idx]["elev_m"]),
+            "end_elev_m": round(samples[-1]["elev_m"]),
+            "max_slope_deg": round(leg_max, 1), "slope_class": slope_class(leg_max),
+            "terrain": terrain_text,
+            "detour": None if not det else {k: det[k] for k in ("straight_km", "straight_steep_m", "steep_m")},
+            "hazard_points": leg_hazards,
+            "walk_hours": round(leg_hours, 3),
+            "cum_hours": round(hours, 3), "cum_km": round(dist / 1000, 3),
+        })
+        prev_bearing = brg
+
+    usable = O2_HOURS * (1 - RESERVE_FRACTION)
+    ascent = sum(l["ascent_m"] for l in legs)
+    descent = sum(l["descent_m"] for l in legs)
+    return {
+        "samples": samples,
+        "legs": legs,
+        "stats": {
+            "distance_km": round(dist / 1000, 3),
+            "ascent_m": ascent, "descent_m": descent,
+            "min_elev_m": round(min(s["elev_m"] for s in samples)),
+            "max_elev_m": round(max(s["elev_m"] for s in samples)),
+            "max_slope_deg": round(max(l["max_slope_deg"] for l in legs), 1),
+            "walk_hours": round(hours, 2),
+            "o2_budget_hours": O2_HOURS, "o2_usable_hours": usable,
+            "fits_single_eva": hours <= usable,
+            "dem_resolution_m": round(2 * math.pi * MARS_RADIUS_M / (360 * PPD)),
+            "step_m": round(step_m),
+            "dem_sources": {k: round(100 * v / len(samples)) for k, v in sources.items()},
+        },
+        "hazards": hazards,
+        "model": f"Tobler hiking fn x {SUIT_FACTOR} suit factor; hazard > {HAZARD_SLOPE_DEG} deg; "
+                 f"{int(RESERVE_FRACTION * 100)}% O2 reserve",
+    }

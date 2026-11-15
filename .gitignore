@@ -1,0 +1,25 @@
+# Python environment
+.venv/
+__pycache__/
+*.pyc
+
+# Environment secrets
+.env
+.env.*
+
+# Large Mars scientific datasets
+data/*.tif
+data/**/*.tif
+data/*.img
+data/**/*.img
+data/**/*.part
+data/imagery/
+data/rover/
+data/esri_dem/
+
+# Download archives
+SWIMProducts.zip
+
+# Generated tour files
+scripts/tour/frames/
+scripts/tour/profile/

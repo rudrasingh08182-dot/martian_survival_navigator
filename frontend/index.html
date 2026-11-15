@@ -1,0 +1,275 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Martian Map · Code Huzzlers</title>
+  <meta name="description" content="Plan a Marswalk on real NASA data: explore Mars in 3D, pick a science EVA, check suits, slopes, sunlight, radiation and space weather, and follow the route with live guidance or a helmet-visor HUD.">
+  <meta name="theme-color" content="#0d0b0a">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <!-- the card social sites show when the link is shared -->
+  <meta property="og:type" content="website">
+  <meta property="og:site_name" content="Martian Map">
+  <meta property="og:title" content="Martian Map: plan a walk on Mars with real NASA data">
+  <meta property="og:description" content="Explore Mars in 3D, pick a science EVA, and check every step for suits, slopes, sunlight, radiation and space weather. NASA Space Apps Challenge 2026.">
+  <meta property="og:url" content="https://martian-map.origin/">
+  <meta property="og:image" content="https://martian-map.origin/media/og-image.jpg">
+  <meta property="og:image:width" content="1200">
+  <meta property="og:image:height" content="630">
+  <meta name="twitter:card" content="summary_large_image">
+  <!-- open connections early; nothing below blocks the first paint except the two small stylesheets -->
+  <link rel="preconnect" href="https://cdnjs.cloudflare.com">
+  <link rel="preconnect" href="https://cdn.jsdelivr.net">
+  <link rel="preconnect" href="https://trek.nasa.gov">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600&family=Fraunces:ital,opsz,wght@0,9..144,300;1,9..144,300&display=swap" media="print" onload="this.media='all'">
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.css">
+  <link rel="stylesheet" href="style.css">
+  <link rel="stylesheet" href="intro.css">
+  <script type="importmap">{ "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.169.0/build/three.module.js",
+    "three/addons/": "https://cdn.jsdelivr.net/npm/three@0.169.0/examples/jsm/" } }</script>
+  <script defer src="https://cdnjs.cloudflare.com/ajax/libs/leaflet/1.9.4/leaflet.min.js"></script>
+</head>
+<body>
+  <header>
+    <div class="brand">MARTIAN <span>MAP</span></div>
+    <div class="header-right">
+      <div id="clock" class="clock" title="Mars time right now. Mars Sol Date: sols (Mars days) counted since 1873. MTC: Coordinated Mars Time, the clock at Mars' prime meridian. Ls: the season (0° is northern spring, 90° summer, 180° autumn, 270° winter). MY: Mars Year."></div>
+      <button id="open-tour" class="intro-replay" type="button" title="A 4-minute video walkthrough of every feature">▶ Tour</button>
+      <button id="replay-intro" class="intro-replay" type="button">Watch intro</button>
+    </div>
+  </header>
+
+  <main>
+    <div id="map"></div>
+
+    <aside id="panel">
+      <nav class="panel-tabs" role="tablist" aria-label="Panel sections">
+        <button type="button" role="tab" data-tab="missions">Missions</button>
+        <button type="button" role="tab" data-tab="route">Route</button>
+        <button type="button" role="tab" data-tab="me">Crew<span class="tab-dot" id="tab-me-dot" hidden></span></button>
+        <button type="button" role="tab" data-tab="sites">Sites</button>
+        <button type="button" role="tab" data-tab="conditions">Conditions</button>
+        <button type="button" role="tab" data-tab="science">Science</button>
+      </nav>
+      <section data-tab="missions">
+        <h2>Science EVAs</h2>
+        <p class="muted small mi-intro">Ready-made Marswalks where NASA's rovers and orbiters have looked closely. Each has a
+          science goal, stations with tasks and kit, and the data layers that matter. <b>Plan this EVA</b> loads one into the
+          planner and checks suits, slopes, sunlight, radiation and space weather.</p>
+        <div id="missions"></div>
+      </section>
+
+      <section data-tab="me">
+        <h2>Your position</h2>
+        <div class="search">
+          <input id="place-q" type="search" autocomplete="off"
+                 placeholder="Search a place (e.g. Gale) or coordinates (18.44, 77.45)">
+          <div id="place-results" class="results" hidden></div>
+        </div>
+        <div class="row" style="margin-top:8px">
+          <button id="pick-me">📍 Pick on map</button>
+          <button id="start-here" disabled>▶ Start route here</button>
+          <button id="center-me" disabled title="Center map on your position">◎</button>
+        </div>
+        <div id="me-card" class="me-card muted small">No position set. Mars has no GPS — search a place,
+          type coordinates from your lander/rover nav fix, or pick a spot on the map.</div>
+      </section>
+
+      <section data-tab="me">
+        <h2>Crew &amp; suits</h2>
+        <div id="suit-summary" class="suit-summary"></div>
+        <details id="suit-edit" class="suit-edit">
+          <summary>Update readings</summary>
+          <form id="suit-form" class="suit-form">
+            <fieldset>
+              <legend>Suit consumables</legend>
+              <label>Oxygen <span><input name="o2Pct" type="number" min="0" max="100" step="1"> %</span></label>
+              <label>Battery <span><input name="batteryPct" type="number" min="0" max="100" step="1"> %</span></label>
+              <label>Cooling water <span><input name="waterPct" type="number" min="0" max="100" step="1"> %</span></label>
+              <label>CO₂ scrubber <span><input name="co2Hours" type="number" min="0" max="12" step="0.1"> h left</span></label>
+            </fieldset>
+            <fieldset>
+              <legend>Astronaut</legend>
+              <label>Body mass <span><input name="bodyKg" type="number" min="40" max="150" step="1"> kg</span></label>
+              <label>Carrying <span><input name="loadKg" type="number" min="0" max="80" step="1"> kg</span></label>
+              <label>Feeling <span><select name="condition"><option value="fresh">Fresh</option><option value="normal">Normal</option><option value="tired">Tired</option></select></span></label>
+              <label>Heart rate <span><input name="heartRate" type="number" min="30" max="220" step="1" placeholder="—"> bpm</span></label>
+              <label>Keep in reserve <span><input name="reservePct" type="number" min="0" max="50" step="1"> %</span></label>
+            </fieldset>
+            <fieldset>
+              <legend>EVA team</legend>
+              <label>Crew on this walk <span><select name="crew"><option value="2">Two (buddy pair)</option><option value="1">One (solo)</option></select></span></label>
+              <label>Rover support <span><select name="rover"><option value="none">None: walk only</option><option value="lrv">Open rover (Apollo LRV style)</option><option value="pressurized">Pressurised rover</option></select></span></label>
+            </fieldset>
+            <fieldset id="ev2-set">
+              <legend>EV2 (your partner's suit)</legend>
+              <label>Oxygen <span><input name="o2Pct2" type="number" min="0" max="100" step="1"> %</span></label>
+              <label>Battery <span><input name="batteryPct2" type="number" min="0" max="100" step="1"> %</span></label>
+              <label>Cooling water <span><input name="waterPct2" type="number" min="0" max="100" step="1"> %</span></label>
+              <label>CO₂ scrubber <span><input name="co2Hours2" type="number" min="0" max="12" step="0.1"> h left</span></label>
+            </fieldset>
+            <button type="button" id="suit-reset">Fresh suit (refill to 100%)</button>
+            <p class="muted small">Effort per step comes from walking speed, slope, body mass and load (the Pandolf
+              equation), × 0.68 for Mars gravity — the drop measured walking at 0.38 g — and × 1.3 for suit joints.
+              It's then turned into oxygen, CO₂-scrubber, cooling-water and battery use. Work at a stop counts at 250 W (Apollo-like
+              station effort); riding a rover at 150 W. A buddy pair walks home together, so every check uses whichever suit has
+              less of each supply. With a rover, any leg of a route can be driven instead of walked. Sources are in the
+              <b>Science</b> tab.</p>
+          </form>
+        </details>
+      </section>
+
+      <section data-tab="sites">
+        <h2>Sites</h2>
+        <select id="site-select"><option value="">Fly to a site…</option></select>
+        <div class="legend">
+          <span><i class="dot lander"></i>Landers &amp; rovers</span>
+          <span><i class="dot candidate"></i>Candidate human sites</span>
+          <span><i class="lm-key">◆</i>Landmarks</span>
+        </div>
+      </section>
+
+      <section data-tab="sites">
+        <h2>Landmarks of Mars</h2>
+        <p class="muted small lm-intro">Mars' major volcanoes, canyons, craters, basins, polar caps and every landing site.
+          Plan a walk to any of them, see it in 3D, or make a <b>🖨 3D-printable relief model</b> of it to brief the crew.</p>
+        <input id="lm-q" type="search" autocomplete="off" placeholder="Filter, e.g. volcano, ice, Gale" aria-label="Filter landmarks">
+        <div id="lm-list"></div>
+        <p class="muted small">Landmark list and descriptions: OrbitStudio.
+          Elevations: NASA MOLA.</p>
+      </section>
+
+      <section data-tab="route">
+        <h2>Marswalk planner</h2>
+        <div class="dir" id="dir">
+          <div class="dir-row"><span class="dir-dot from" id="dir-from-dot" aria-hidden="true"></span>
+            <input id="dir-from" type="search" autocomplete="off" placeholder="Choose a starting point" aria-label="Starting point">
+            <button id="dir-swap" type="button" class="dir-x" title="Swap start and destination" aria-label="Swap start and destination">⇅</button></div>
+          <div id="dir-stops"></div>
+          <div class="dir-row"><span class="dir-dot to" id="dir-to-dot" aria-hidden="true"></span>
+            <input id="dir-to" type="search" autocomplete="off" placeholder="Choose a destination" aria-label="Destination"></div>
+          <button id="dir-add-stop" type="button" class="link">+ Add a stop</button>
+          <div id="dir-results" class="results" hidden></div>
+        </div>
+        <div class="row">
+          <button id="draw">✚ Draw on map</button>
+          <button id="undo">Undo</button>
+          <button id="clear">Clear</button>
+          <button id="export">Export</button>
+        </div>
+        <div class="row options">
+          <label>Depart <input id="depart" type="time" value="09:00"> <span class="muted">local solar time</span></label>
+          <label><input id="roundtrip" type="checkbox" checked> Return to start</label>
+          <label title="Route each leg around ground steeper than 15° (crater walls, scarps, big rock formations) when the terrain data shows a gentler line"><input id="avoid" type="checkbox" checked> Walk around steep ground</label>
+        </div>
+
+        <ol id="howto" class="howto">
+          <li>Pick a <b>start</b> and a <b>destination</b> above: your position, a site, any named place,
+            coordinates (e.g. <i>-4.6, 137.4</i>) or a point on the map.</li>
+          <li>Or click <b>✚ Draw on map</b> and click stops <b>A</b>, <b>B</b>, <b>C</b>… in walking order.</li>
+          <li>Drag any pin to adjust. Right-click the map for a dropped pin.</li>
+          <li>Or start from a ready-made science EVA in <a href="#" data-goto="missions">Missions</a>.</li>
+        </ol>
+
+        <div id="summary" class="summary" hidden></div>
+        <div id="directions" class="directions"></div>
+
+        <div id="profile-wrap" hidden>
+          <h3>Elevation profile</h3>
+          <canvas id="profile" height="170"></canvas>
+          <p class="muted small" id="dem-note"></p>
+        </div>
+      </section>
+
+      <section data-tab="conditions">
+        <h2>Conditions at destination</h2>
+        <div id="conditions" class="stats"></div>
+        <h3 class="sci-sub">Space weather</h3>
+        <div id="spacewx" class="sci"><div class="muted small">Checking the Sun…</div></div>
+        <h3 class="sci-sub">What orbiters found here</h3>
+        <div id="whats-here" class="sci"></div>
+        <h3 class="sci-sub">Hazards &amp; resources here</h3>
+        <div id="hazards" class="sci"></div>
+        <p class="muted small">Sun, local time and Earth's distance are computed (Mars24 algorithm, JPL orbital
+          elements). The hazard notes come from published mission results — tap a number for its source.</p>
+      </section>
+
+      <section data-tab="science">
+        <h2>The science behind the numbers</h2>
+        <p class="muted small sci-intro">Every figure this app shows comes from a measurement or a published
+          model. Here are the <b id="science-count"></b> sources, what each one found, and where the app uses it.
+          The small numbers next to a figure link here.</p>
+        <div id="science-lib"></div>
+        <h3 class="sci-topic">Subsurface water ice · NASA/PSI SWIM 2.0</h3>
+        <div class="sci">
+          <p class="muted small">Three global combined ice-consistency layers are available in <b>Layers → Science data</b>:
+            0–1 m, 1–5 m and deeper than 5 m. Each pixel is about 3 km across and the products cover roughly 60°N to 60°S.</p>
+          <p class="muted small">Blue/cyan indicates positive consistency with subsurface ice evidence; orange indicates negative consistency;
+            neutral grey indicates an inconclusive score. Transparent areas have no mapped data. These scores are <b>not</b> percentages,
+            probabilities, measured ice thickness or confirmed water reserves. The SWIM products combine different orbital proxies.</p>
+          <p class="muted small">The Conditions tab also reports the SWIM score at the map centre for each depth. Source:
+            <a href="https://swim.psi.edu/SWIM2Products.php" target="_blank" rel="noopener">NASA/PSI SWIM 2.0 products</a>.</p>
+        </div>
+        <h3 class="sci-topic">About this project</h3>
+        <p class="muted small">Built by Rishi (Team Code Huzzlers) for the 2026 NASA Space Apps Challenge, <i>Interplanetary
+          Survival Guide: Martian Map</i>. Source code: <a href="https://github.com/RISHI-1453/NASA_Space-Apps_Challenge_Martian_Map" target="_blank" rel="noopener">GitHub</a>.</p>
+        <p class="muted small"><b>AI use:</b> the code was written with help from Claude, an AI coding assistant, working from
+          Rishi's direction; the intro soundtrack is synthesised by that code, and the tour video is a screen recording of
+          this site captioned by AI-assisted scripts. No map, image or number on the site is AI-generated: all of it comes
+          from the NASA, ESA and USGS data and the published studies listed above.</p>
+      </section>
+    </aside>
+  </main>
+
+  <div id="readout" class="readout"></div>
+  <script defer src="marstime.js"></script>
+  <script defer src="suit.js"></script>
+  <script defer src="science.js"></script>
+  <script defer src="spaceweather.js"></script>
+  <script defer src="app.js"></script>
+  <script defer src="directions.js"></script>
+  <script defer src="datalayers.js"></script>
+  <script defer src="missions.js"></script>
+  <script defer src="checklist.js"></script>
+  <script defer src="groundview.js"></script>
+  <script defer src="globe.js"></script>
+  <script defer src="printmodel.js"></script>
+  <script defer src="landmarks.js"></script>
+  <script defer src="navigate.js"></script>
+  <script defer src="tour.js"></script>
+  <script type="module">
+    import { playIntro } from "./intro.js";
+    // where the whole planet sits on screen, so the intro's unrolled globe lands exactly on it
+    function mapWorldRect() {
+      const r = map.getContainer().getBoundingClientRect();
+      const nw = map.latLngToContainerPoint([90, -180]), se = map.latLngToContainerPoint([-90, 180]);
+      return { left: r.left + nw.x, top: r.top + nw.y, width: se.x - nw.x, height: se.y - nw.y };
+    }
+    function startIntro() {
+      map.setView([0, 0], 1, { animate: false }); // the intro ends on the whole planet
+      window.intro = playIntro({ // handle kept for testing / a presenter remote
+        mapRect: mapWorldRect,
+        autoplay: false,
+        onDone: () => {
+
+    map.invalidateSize();
+
+    if (me) {
+        map.flyTo(me, 11, { duration: 2.4 });
+    }
+
+    // Guided tour is now manual.
+    // It will only open when the user clicks the Tour button.
+
+},
+      });
+    }
+    // plays every time the app opens; add #nointro (or ?intro=0) to the URL to go straight to the map
+    const skip = /nointro/.test(location.hash) || new URLSearchParams(location.search).get("intro") === "0";
+    if (!skip) startIntro();
+    document.getElementById("replay-intro").onclick = startIntro;
+  </script>
+</body>
+</html>
