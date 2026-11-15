@@ -2,7 +2,11 @@
 # (Google Cloud Run and Azure Container Apps set it), else 7860.
 FROM python:3.12-slim
 
-# Spaces run the container as user 1000, and the app writes its tile caches under data/
+# Install system library required by Rasterio/GDAL
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libexpat1 \
+    && rm -rf /var/lib/apt/lists/*
+
 RUN useradd -m -u 1000 user
 USER user
 ENV HOME=/home/user PATH=/home/user/.local/bin:$PATH PYTHONUNBUFFERED=1
